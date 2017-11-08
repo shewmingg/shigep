@@ -32,7 +32,7 @@ class LabelShufflingSampler(Sampler):
         return iter(shuffle(list))
 
     def __len__(self):
-        return self.num_samples
+        return np.amax(self.count_of_each_label) * len(self.count_of_each_label)
 
 
 def submit(**kwargs):
