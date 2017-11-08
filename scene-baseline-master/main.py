@@ -1,5 +1,5 @@
 #coding:utf8
-import os,json,time,fire,ipdb,tqdm
+import os,json,time,fire,ipdb
 
 import numpy as np
 import torch as t
@@ -9,9 +9,31 @@ from torchnet import meter
 
 from utils import Visualizer,topk_acc,opt
 from dataset import ClsDataset
+
 import models
+from random import shuffle
 
 vis = Visualizer(env=opt.env)
+
+
+class LabelShufflingSampler(Sampler):
+    """
+    label shuffling technique aimed to deal with imbalanced class problem
+    """
+
+    def __init__(self, count_of_each_label):
+        self.count_of_each_label = count_of_each_label
+
+    def __iter__(self):
+        largest = np.amax(self.count_of_each_label)
+        for x in range(len(self.count_of_each_label)):
+            for y in range(largest):
+                list.append(np.remainder(t.randperm(largest).numpy(), x))
+        return iter(shuffle(list))
+
+    def __len__(self):
+        return self.num_samples
+
 
 def submit(**kwargs):
     '''
@@ -109,7 +131,7 @@ def train(**kwargs):
         acc_meter.reset()
         top1_meter.reset()
 
-        for ii, data in tqdm.tqdm(enumerate(dataloader, 0)):
+        for ii, data in (enumerate(dataloader, 0)):
             # 训练
             optimizer.zero_grad()
             input, label,_ = data
@@ -167,6 +189,7 @@ def train(**kwargs):
             optimizer = model.get_optimizer(lr1,lr2)
 
         vis.vis.save([opt.env])
+
 
 if __name__ == '__main__':
     fire.Fire()

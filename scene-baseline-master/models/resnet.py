@@ -1,7 +1,7 @@
 #coding:utf8
 import torchvision as tv
 from torch import nn
-from basic_module import BasicModule
+from .basic_module import BasicModule
 import torch as t
 
 class ResNet(BasicModule):
