@@ -8,7 +8,6 @@ class ResNet(BasicModule):
     def __init__(self,model,opt=None,feature_dim=2048,name='resnet'):
         super(ResNet, self).__init__(opt)
         self.model_name=name
-        
         model.avgpool = nn.AdaptiveAvgPool2d(1)
         del model.fc
         model.fc = lambda x:x

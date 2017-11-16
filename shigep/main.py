@@ -1,6 +1,7 @@
 #coding:utf8
-import os,json,time,fire,ipdb
-
+import os,json,fire,tqdm
+import time
+import ipdb
 import numpy as np
 import torch as t
 from torch import nn, optim
@@ -8,32 +9,9 @@ from torch.autograd import Variable
 from torchnet import meter
 
 from utils import Visualizer,topk_acc,opt
-from dataset import ClsDataset
-
+from dataset.clsDataset import ClsDataset
 import models
-from random import shuffle
-
 vis = Visualizer(env=opt.env)
-
-
-class LabelShufflingSampler(Sampler):
-    """
-    label shuffling technique aimed to deal with imbalanced class problem
-    """
-
-    def __init__(self, count_of_each_label):
-        self.count_of_each_label = count_of_each_label
-
-    def __iter__(self):
-        largest = np.amax(self.count_of_each_label)
-        for x in range(len(self.count_of_each_label)):
-            for y in range(largest):
-                list.append(np.remainder(t.randperm(largest).numpy(), x))
-        return iter(shuffle(list))
-
-    def __len__(self):
-        return np.amax(self.count_of_each_label) * len(self.count_of_each_label)
-
 
 def submit(**kwargs):
     '''
@@ -44,7 +22,7 @@ def submit(**kwargs):
     # 模型
     model = getattr(models,opt.model)(opt)
     model.load(opt.load_path)
-    model.eval()
+    model.eval().cuda()
 
     # 数据
     dataset = ClsDataset(opt)
@@ -55,10 +33,12 @@ def submit(**kwargs):
     results = []
     for ii, data in tqdm.tqdm(enumerate(dataloader)):
         input, label,image_ids = data
-        val_input = Variable(input, volatile=True)
-        val_label = Variable(label.type(t.LongTensor), volatile=True)
-        score = model(val_input)
-        predict = score.data.topk(k=3)[1].tolist()
+        bs, ncrops, c, h, w = input.size()
+        test_input = Variable(input.view(-1, c, h, w), volatile=True).cuda()
+        scores = model(test_input)
+        prob = t.nn.functional.softmax(scores)
+        prob_avg = prob.view(bs, ncrops, -1).mean(1)
+        predict = prob_avg.data.topk(k=3)[1].tolist()
         result = [  {"image_id": image_id,
                      "label_id": label_id }
                          for image_id,label_id in zip(image_ids,predict) ] 
@@ -67,7 +47,6 @@ def submit(**kwargs):
     # 保存文件
     with open(opt.result_path,'w') as f:
         json.dump(results,f)
-
 
 def val(model,dataset):
     '''
@@ -78,14 +57,19 @@ def val(model,dataset):
     dataset.val()
     acc_meter = meter.AverageValueMeter()
     top1_meter = meter.AverageValueMeter()
-    dataloader =  t.utils.data.DataLoader(dataset,opt.batch_size, opt.shuffle, num_workers=opt.workers,pin_memory=True)
+    dataloader =  t.utils.data.DataLoader(dataset,opt.batch_size/2, opt.shuffle, num_workers=8,pin_memory=True)
     for ii, data in tqdm.tqdm(enumerate(dataloader)):
-        input, label,_ = data
-        val_input = Variable(input, volatile=True)
-        val_label = Variable(label.type(t.LongTensor), volatile=True)
-        score = model(val_input)
-        acc = topk_acc(score.data,label  )
-        top1 = topk_acc(score.data,label,k=1)
+        input, label, _ = data
+        #bs, ncrops, c, h, w = input.size()
+        #val_input = Variable(input.view(-1, c, h, w), volatile=True).cuda()
+        val_input = Variable(input, volatile=True).cuda()
+        #val_label = Variable(label.type(t.LongTensor), volatile=True).cuda()
+        #scores = model(val_input)  # fuse batch size and ncrops   bs*ncrop,80
+        #prob = t.nn.functional.softmax(scores)
+       # prob_avg = prob.view(bs, ncrops, -1).mean(1)
+        prob_avg = model(val_input)
+        acc = topk_acc(prob_avg.data,label.cuda())
+        top1 = topk_acc(prob_avg.data,label.cuda(),k=1)
         acc_meter.add(acc)
         top1_meter.add(top1)
     model.train()
@@ -93,45 +77,41 @@ def val(model,dataset):
     print(acc_meter.value()[0],top1_meter.value()[0])
     return acc_meter.value()[0], top1_meter.value()[0]
 
-
 def train(**kwargs):
-    '''
-    训练模型
-    '''
     opt.parse(kwargs)
-
     lr1, lr2 = opt.lr1, opt.lr2
+    lr3 = opt.lr3
     vis.vis.env = opt.env
-    
+    max_acc = 0
     # 模型
-    model = getattr(models,opt.model)(opt)
-    if opt.load_path:
-        model.load(opt.load_path)
+    model = getattr(models, opt.model)(opt)
+    optimizer = model.get_optimizer(opt.model, lr1, lr2,lr3)
+    if opt.load_path:#load optimizer + model
+        #checkpoint = t.load(opt.load_path,lambda storage, loc: storage)
+        checkpoint = t.load(opt.load_path)
+        model.load_state_dict(checkpoint['d'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        max_acc = checkpoint['acc']
+        print('using checkpoint:{}'.format(opt.load_path))
+        print('old config:')
+        print(checkpoint['opt'])
     print(model)
-    model
-    optimizer = model.get_optimizer(lr1,lr2)
+    model.cuda()
     criterion = getattr(models,opt.loss)()
-
     # 指标：求均值
     loss_meter = meter.AverageValueMeter()
     acc_meter = meter.AverageValueMeter()
     top1_meter = meter.AverageValueMeter()
-    
-    step = 0
-    max_acc = 0
     vis.vis.texts = ''
-
     # 数据
-    dataset = ClsDataset(opt)
+    dataset = ClsDataset()
     dataloader =  t.utils.data.DataLoader(dataset, opt.batch_size, opt.shuffle, num_workers=opt.workers,pin_memory=True)
-    
-    # 训练
+    time_begin = time.time()
     for epoch in range(opt.max_epoch):
         loss_meter.reset()
         acc_meter.reset()
         top1_meter.reset()
-
-        for ii, data in (enumerate(dataloader, 0)):
+        for ii, data in tqdm.tqdm(enumerate(dataloader, 0)):
             # 训练
             optimizer.zero_grad()
             input, label,_ = data
@@ -141,22 +121,19 @@ def train(**kwargs):
             error = criterion(output, label)
             error.backward()
             optimizer.step()
-
             # 计算损失的均值和训练集的准确率均值
             loss_meter.add(error.data[0])
             acc = topk_acc(output.data,label.data)
             acc_meter.add(acc)
             top1_acc = topk_acc(output.data,label.data,k=1)
             top1_meter.add(top1_acc)
-
             # 可视化
             if (ii+1) % opt.plot_every == 0:
                 if os.path.exists(opt.debug_file):
                     ipdb.set_trace()
-
                 log_values = dict(loss = loss_meter.value()[0],
                                    train_acc = acc_meter.value()[0],
-                                     epoch = epoch, 
+                                    epoch = epoch,
                                     ii = ii,
                                     train_top1_acc= top1_meter.value()[0]
                                     )
@@ -166,16 +143,15 @@ def train(**kwargs):
         accuracy,top1_accuracy = val(model,dataset)
         vis.plot('val_acc', accuracy)
         vis.plot('val_top1',top1_accuracy)
-        info = time.strftime('[%m%d_%H%M%S]') + 'epoch:{epoch},val_acc:{val_acc},lr:{lr},val_top1:{val_top1},train_acc:{train_acc}<br>'.format(
+        info = time.strftime('[%m%d_%H%M%S]') + 'epoch:{epoch},train_acc:{train_acc},mac_acc:{max_acc},val_acc:{val_acc},lr:{lr}<br>'.format(
             epoch=epoch,
             lr=lr1,
+            train_acc=acc_meter.value(),
             val_acc=accuracy,
-            val_top1=top1_accuracy,
-            train_acc=acc_meter.value()
+            max_acc=max_acc
+            #val_top1=top1_accuracy
         )
         vis.vis.texts += info
-        vis.vis.text(vis.vis.texts, win=u'log')
-
         # 调整学习率
         # 如果验证集上准确率降低了，就降低学习率，并加载之前的最好模型
         # 否则保存模型，并记下模型保存路径
@@ -184,12 +160,26 @@ def train(**kwargs):
             best_path = model.save(accuracy)
         else:
             if lr1==0:	lr1=lr2
+            if lr3:
+                lr3=lr1
+                lr3 = lr3*opt.lr_decay
             model.load(best_path)
             lr1, lr2 = lr1 *opt.lr_decay, lr2 * opt.lr_decay
-            optimizer = model.get_optimizer(lr1,lr2)
+            optimizer = model.get_optimizer(opt.model,lr1,lr2,lr3)
+            vis.vis.texts += 'change learning_rate'
 
+
+
+           #for param_group in optimizer.param_groups:
+             #   lr = init_lr * (0.5 ** (epoch // lr_decay_epoch))
+              #  param_group['lr'] = lr
+               # param_group['weight_decay'] = weight_decay
+
+        vis.vis.text(vis.vis.texts, win=u'log')
         vis.vis.save([opt.env])
-
-
+        time_all = time.time() - time_begin
+        print(time_all)
+    print('Training complete in {:.0f}hour {:.0f}min'.format(time_all // 3600, time_all // 60))
+    print('Best val Acc: {:4f}'.format(max_acc))
 if __name__ == '__main__':
     fire.Fire()
